@@ -77,9 +77,10 @@ If **all** of these are true, this repo's fix will solve your problem:
 
 ## Full SOP
 
-The complete step-by-step setup guide (in Traditional Chinese, with every command and config file) is in **[SOP.md](./SOP.md)**.
+Pick your language — both versions are complete, not summaries:
 
-English translation TBD — contributions welcome.
+- 🇬🇧 **English** — [`SOP-en.md`](./SOP-en.md)
+- 🇹🇼 **繁體中文** — [`SOP.md`](./SOP.md)
 
 ## One-line Verification of the Root Cause
 
