@@ -78,24 +78,39 @@ sudo apt install -y build-essential git dkms linux-headers-$(uname -r) \
 
 ---
 
-## Phase 2 — Build rtw89 out-of-tree driver
+## Phase 2 — Build rtw89 out-of-tree driver (via DKMS)
+
+> **v4.1 change**: switched from `make install` to DKMS. The plain `make install` drops modules into the *current* kernel's `extra/` only — **the next kernel upgrade silently breaks WiFi** because the module isn't rebuilt against the new kernel. DKMS with `AUTOINSTALL=yes` hooks into `/etc/kernel/postinst.d/dkms`, so apt automatically rebuilds the module whenever the kernel changes. This is the root-cause fix for the recurring "kernel update broke WiFi" class of bugs (the old Troubleshooting recipe below).
 
 ```bash
 cd ~
 git clone https://github.com/morrownr/rtw89.git
-cd rtw89
-make -j$(nproc)
-sudo make install
 
-# Install firmware in both locations (compat with different firmware load paths)
-sudo mkdir -p /lib/firmware/rtw89
-sudo cp firmware/rtw8852c_fw-2.bin /lib/firmware/rtw89/
-sudo cp firmware/rtw8852c_fw-2.bin /lib/firmware/
+# dkms.conf already defines PACKAGE_NAME / PACKAGE_VERSION / AUTOINSTALL=yes
+PKG_VER=$(awk -F'"' '/^PACKAGE_VERSION/{print $2}' ~/rtw89/dkms.conf)
+echo "rtw89 package version: $PKG_VER"
+
+sudo cp -r ~/rtw89 /usr/src/rtw89-${PKG_VER}
+sudo dkms add     -m rtw89 -v ${PKG_VER}
+sudo dkms install -m rtw89 -v ${PKG_VER}
+
+# Firmware is bundled inside morrownr/rtw89 and loaded automatically by the driver.
+# If dmesg reports firmware load failure, drop it in manually:
+#   sudo mkdir -p /lib/firmware/rtw89
+#   sudo cp ~/rtw89/firmware/rtw8852c_fw-2.bin /lib/firmware/rtw89/
+#   sudo cp ~/rtw89/firmware/rtw8852c_fw-2.bin /lib/firmware/
 
 sudo depmod -a
 ```
 
-**Verify**: `modinfo rtw89_8852cu_git | head -3`
+**Verify**:
+
+```bash
+dkms status                                              # expect: rtw89/<ver>, <kernel>: installed
+ls /lib/modules/$(uname -r)/updates/dkms/ | grep rtw89   # all _git modules present
+grep AUTOINSTALL /usr/src/rtw89-*/dkms.conf              # = yes → next kernel auto-rebuilds
+modinfo rtw89_8852cu_git | head -3                       # sanity
+```
 
 ---
 
@@ -349,7 +364,27 @@ If this recurs, Phase 3e's udev rule is required (it's already in the SOP above,
 
 ### `wpa_supplicant@.service` failed with `Dependency failed`
 
-Same as above — interface doesn't exist yet. Load the module, restart the service.
+Same as above — interface doesn't exist yet. Load the module, then **always `reset-failed` before `start`** (see next entry — `restart` alone won't recover the unit).
+
+### `systemctl start wpa_supplicant@<IFACE>` reports success but the service stays `inactive`
+
+**v4.1 addition.** The `wpa_supplicant@.service` template declares `Requires=sys-subsystem-net-devices-%i.device`. If the module wasn't loaded at boot, this dependency permanently fails, **and systemd does not retry the unit even after the dependency is later satisfied** — the unit is stuck in "dependency-failed" state until you explicitly clear it.
+
+```bash
+# 1. Confirm module + interface are both present now
+lsmod | grep rtw89_8852cu_git
+ip link | grep wlxe
+
+# 2. Clear systemd's sticky failure record, then start
+sudo systemctl reset-failed wpa_supplicant@<IFACE>.service
+sudo systemctl start        wpa_supplicant@<IFACE>.service
+
+# 3. Verify association
+sudo journalctl -u wpa_supplicant@<IFACE>.service -n 20 --no-pager
+# Expected: CTRL-EVENT-CONNECTED + [PTK=CCMP GTK=CCMP]
+```
+
+> This trap wasn't in v4 — only caught by hitting it in practice on a kernel-upgrade recovery. With v4 (`make install`, no DKMS), the module disappears on kernel upgrade → boot service permanently fails → even after manually `modprobe`-ing the module, the service won't recover without `reset-failed`. v4.1's DKMS Phase 2 prevents the underlying disappearance, but if you're upgrading from a v4 install on a freshly broken system, verify `dkms status` shows `installed` for the current kernel *before* rebooting.
 
 ### 5GHz connects but disconnects after a few seconds
 
@@ -367,20 +402,30 @@ Password is confirmed correct (phone/laptop connect with same credentials)?
 
 ### Kernel update broke WiFi
 
-The out-of-tree driver needs recompiling against the new kernel:
+**From v4.1 onward Phase 2 uses DKMS — this should self-heal** (apt's `/etc/kernel/postinst.d/dkms` hook auto-rebuilds the module against the new kernel). If WiFi is still broken after a kernel upgrade, check in order:
 
 ```bash
-cd ~/rtw89 && git pull && make clean && make -j$(nproc) && sudo make install && sudo depmod -a && sudo reboot
+# 1. Did DKMS actually rebuild for the current kernel?
+dkms status
+# Expected: rtw89/<ver>, <current uname -r>: installed
+# If the current kernel row is missing:
+PKG_VER=$(awk -F'"' '/^PACKAGE_VERSION/{print $2}' /usr/src/rtw89-*/dkms.conf | head -1)
+sudo dkms install -m rtw89 -v $PKG_VER
+
+# 2. Refresh module map + load
+sudo depmod -a
+sudo modprobe rtw89_8852cu_git
+ip link | grep wlxe   # interface should appear
+
+# 3. Clear systemd's sticky failure on the supplicant unit, then start
+sudo systemctl reset-failed wpa_supplicant@<IFACE>.service
+sudo systemctl start        wpa_supplicant@<IFACE>.service
+
+# 4. Verify
+iw dev <IFACE> link
 ```
 
-Consider DKMS so this happens automatically:
-
-```bash
-cd ~/rtw89
-sudo dkms add .
-sudo dkms build rtw89/$(git describe --always)
-sudo dkms install rtw89/$(git describe --always)
-```
+**Still on the v4 install path (`make install`, no DKMS)?** Switch to v4.1's DKMS install (see Phase 2) before doing anything else — otherwise this same recovery dance recurs on every kernel upgrade.
 
 ---
 
@@ -494,9 +539,19 @@ This diagnosis isn't documented anywhere I could find. Google, Stack Overflow, A
 
 ---
 
-**Test environment**: Ubuntu 24.04.3 LTS, kernel 6.8.0-110-generic, TP-Link TXE70UH (USB 35bc:0102), NetworkManager 1.46.0, wpa_supplicant 2.10
+**Test environment**: Ubuntu 24.04.3 LTS, kernel 6.8.0-111-generic, TP-Link TXE70UH (USB 35bc:0102), NetworkManager 1.46.0, wpa_supplicant 2.10
 
 **Measured boot-to-5GHz-connected**: 6 seconds on this hardware, -7 dBm signal, stable.
+
+---
+
+## Version history
+
+- **v4.1 (2026-05-15)**: Phase 2 switched from `make install` to DKMS (`AUTOINSTALL=yes` makes apt's kernel postinst hook auto-rebuild the module on every kernel upgrade). Added Troubleshooting entry for the `systemctl start` succeeds but the unit stays `inactive` case — `wpa_supplicant@.service`'s `Requires=sys-subsystem-net-devices-%i.device` makes the unit permanently dependency-failed if the module wasn't loaded at boot, and `reset-failed` is required before retry. Both gaps were caught by hitting them in production after an unattended kernel upgrade.
+- **v4 (2026-04-24)**: Abandoned iwd backend; switched to per-interface `wpa_supplicant@<iface>` + scoped `systemd-networkd` — completely bypass NM for the WiFi NIC. This is the actual root-cause fix for 5GHz.
+- v3 (2026-04-24): Added `wifi.powersave=2`, masked systemd-networkd globally, tried iwd backend (later found to have a secret-passing bug with `@` in SSIDs).
+- v2 (2026-04-24): snap NM removal, the `_git` module-name discovery, USB autosuspend off, NM connection-level hardening.
+- v1 (2026-04-23): First pass, missed six critical landmines.
 
 ---
 

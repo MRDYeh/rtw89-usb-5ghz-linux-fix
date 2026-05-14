@@ -92,20 +92,36 @@ sudo apt install -y build-essential git dkms linux-headers-$(uname -r) \
 
 ---
 
-## Phase 2 — 編譯 rtw89 out-of-tree driver
+## Phase 2 — 編譯 rtw89 out-of-tree driver(走 DKMS)
+
+> **v4.1 變更**:從 `make install` 改成 DKMS。`make install` 把 module 塞到目前核心的 `extra/`,**升核心後不會自動重編** → 下次 unattended-upgrades 換 kernel 時 WiFi 整個掛掉(Troubleshooting 有完整復原步驟)。DKMS 設定 `AUTOINSTALL=yes`,apt 升核心會自動 hook 重編,根本性解這個 class 的 bug。
 
 ```bash
 cd ~
 git clone https://github.com/morrownr/rtw89.git
-cd rtw89
-make -j$(nproc)
-sudo make install
 
-sudo mkdir -p /lib/firmware/rtw89
-sudo cp firmware/rtw8852c_fw-2.bin /lib/firmware/rtw89/
-sudo cp firmware/rtw8852c_fw-2.bin /lib/firmware/
+# dkms.conf 已含 PACKAGE_NAME / PACKAGE_VERSION / AUTOINSTALL=yes
+PKG_VER=$(awk -F'"' '/^PACKAGE_VERSION/{print $2}' ~/rtw89/dkms.conf)
+echo "rtw89 package version: $PKG_VER"
+
+sudo cp -r ~/rtw89 /usr/src/rtw89-${PKG_VER}
+sudo dkms add     -m rtw89 -v ${PKG_VER}
+sudo dkms install -m rtw89 -v ${PKG_VER}
+
+# firmware 走 morrownr/rtw89 的內建路徑;若 dmesg 出現 firmware load fail 再手動補:
+# sudo mkdir -p /lib/firmware/rtw89
+# sudo cp ~/rtw89/firmware/rtw8852c_fw-2.bin /lib/firmware/rtw89/
+# sudo cp ~/rtw89/firmware/rtw8852c_fw-2.bin /lib/firmware/
 
 sudo depmod -a
+```
+
+**驗證**:
+
+```bash
+dkms status                                              # rtw89/<ver>, <kernel>: installed
+ls /lib/modules/$(uname -r)/updates/dkms/ | grep rtw89   # _git modules 都在
+grep AUTOINSTALL /usr/src/rtw89-*/dkms.conf              # = yes (升核心自動重編)
 ```
 
 ---
@@ -342,7 +358,27 @@ sudo systemctl restart wpa_supplicant@wlxe4fac4a5668e
 
 ### 症狀:`wpa_supplicant@.service` Dependency failed
 
-Interface 不存在。先 `modprobe rtw89_8852cu_git` 救 interface,再重啟 service(見上)。
+Interface 不存在。先 `modprobe rtw89_8852cu_git` 救 interface,**接著一定要先 `reset-failed` 才能 start**(見下一條)。
+
+### 症狀:module 補回去了、interface 也回來了,但 `systemctl start wpa_supplicant@<IFACE>` 服務還是 inactive
+
+**v4.1 補充**:`wpa_supplicant@.service` template 內含 `Requires=sys-subsystem-net-devices-%i.device`。如果開機時 module 沒先載好、interface 不存在,這個 dependency 永久失敗,**systemd 即使後來 dependency 滿足也不會自動 retry** — service 進「dependency-failed 死狀態」。
+
+```bash
+# 1. 先確認 module + interface 都在
+lsmod | grep rtw89_8852cu_git
+ip link | grep wlxe
+
+# 2. 重置 systemd 對該 unit 的失敗記憶,然後 start
+sudo systemctl reset-failed wpa_supplicant@<IFACE>.service
+sudo systemctl start        wpa_supplicant@<IFACE>.service
+
+# 3. 確認連上
+sudo journalctl -u wpa_supplicant@<IFACE>.service -n 20 --no-pager
+# 期望:CTRL-EVENT-CONNECTED + [PTK=CCMP GTK=CCMP]
+```
+
+> 這個 trap 之前在 v4 SOP 沒寫,實際升核心後撞到。`make install`(v4 舊路徑)+ 沒 DKMS = 升核心後 module 不在 → boot 時 service 永久失敗 → 即使後來把 module 補回去、service 還是 inactive。Phase 2 走 DKMS 後 module 會在 boot 前就有,但若你是從 v4 升上來,第一次 reboot 前最好確認 `dkms status` 對 current kernel 是 `installed`。
 
 ### 症狀:5G 連上但幾秒後斷
 
@@ -359,10 +395,30 @@ Interface 不存在。先 `modprobe rtw89_8852cu_git` 救 interface,再重啟 se
 
 ### 症狀:kernel update 後 WiFi 掛了
 
-out-of-tree driver 要重編:
+**v4.1 起 Phase 2 走 DKMS,理論上不會再發生**(apt 升核心會 hook `/etc/kernel/postinst.d/dkms` 自動重編)。如果還是壞了,依序檢查:
+
 ```bash
-cd ~/rtw89 && git pull && make clean && make -j$(nproc) && sudo make install && sudo depmod -a && sudo reboot
+# 1. 先看 DKMS 是不是漏跑了
+dkms status
+# 期望:rtw89/<ver>, <當前 kernel>: installed
+# 如果當前 kernel 那行不見:
+PKG_VER=$(awk -F'"' '/^PACKAGE_VERSION/{print $2}' /usr/src/rtw89-*/dkms.conf | head -1)
+sudo dkms install -m rtw89 -v $PKG_VER
+
+# 2. depmod + 載入 module
+sudo depmod -a
+sudo modprobe rtw89_8852cu_git
+ip link | grep wlxe  # 應出現
+
+# 3. 解 systemd 對 service 的「dependency failed」記憶,start
+sudo systemctl reset-failed wpa_supplicant@<IFACE>.service
+sudo systemctl start        wpa_supplicant@<IFACE>.service
+
+# 4. 驗證
+iw dev <IFACE> link
 ```
+
+**還在用 v4 舊路徑(`make install`)的話**,先換到 v4.1 的 DKMS 安裝(見 Phase 2),再依上面流程操作 — 之後升核心就不用再來一次。
 
 ---
 
@@ -475,9 +531,10 @@ Global 沒人把這個寫清楚過(google 找不到),你的部落格如果公開
 
 ---
 
-**測試環境**: Ubuntu 24.04.3 LTS, kernel 6.8.0-110-generic, TP-Link TXE70UH (USB 35bc:0102), NetworkManager 1.46.0, wpa_supplicant 2.10
+**測試環境**: Ubuntu 24.04.3 LTS, kernel 6.8.0-111-generic, TP-Link TXE70UH (USB 35bc:0102), NetworkManager 1.46.0, wpa_supplicant 2.10
 
 **版本歷史**:
+- **v4.1 (2026-05-15)**: Phase 2 從 `make install` 改成 DKMS(`AUTOINSTALL=yes`,升核心會自動重編 module);新增 Troubleshooting 條目「`systemctl start` 後 service 還 inactive → 需 `reset-failed`」(systemd 對 dependency-failed 的永久死狀態,實測撞到才補)
 - **v4 (2026-04-24 06:00)**: 放棄 iwd backend,改 per-interface wpa_supplicant + systemd-networkd,完全 bypass NM for WiFi — 真正永久解 5GHz
 - v3 (2026-04-24 04:00): 加 wifi.powersave=2 / systemd-networkd mask / iwd backend(iwd 方案事後證實有 bug)
 - v2 (2026-04-24 02:00): snap NM、module `_git` 後綴、USB autosuspend、NM 安全欄位
